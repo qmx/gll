@@ -16,5 +16,6 @@ test = false
 
 [workspace]
 members = [
+    "dart",
     "tests"
 ]

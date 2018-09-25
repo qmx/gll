@@ -486,7 +486,7 @@ impl<'a, 'i, 's> ", name, "<'a, 'i, 's> {
             p.threads.spawn(
                 Continuation {
                     code: call.callee,
-                    fn_input: call.range,
+                    frame: ::std::rc::Rc::new(gll::runtime::StackNode::new(call.range)),
                     state: 0,
                 },
                 call.range,
@@ -998,7 +998,7 @@ impl<'a> Continuation<'a> {
                 self.code = Code::Inline(format!(
                     "
                 c.code = {};
-                p.threads.spawn(c, _range);",
+                p.threads.spawn(c.clone(), _range);",
                     label
                 ));
                 self.to_inline()
@@ -1123,7 +1123,7 @@ fn call(callee: CodeLabel) -> Thunk<impl FnOnce(Continuation) -> Continuation> {
         cont.code = Code::Inline(format!(
             "
                 c.code = {};
-                p.call(Call {{ callee: {}, range: _range }}, c);",
+                p.call(Call {{ callee: {}, range: _range }}, c.clone());",
             cont.to_label(),
             callee
         ));
@@ -1134,7 +1134,7 @@ fn call(callee: CodeLabel) -> Thunk<impl FnOnce(Continuation) -> Continuation> {
 fn ret() -> Thunk<impl FnOnce(Continuation) -> Continuation> {
     thunk!(
         "
-                p.ret(c, _range);"
+                p.ret(c.clone(), _range);"
     ) + Thunk::new(|mut cont| {
         assert_eq!(cont.to_inline(), "");
         cont
@@ -1149,7 +1149,7 @@ fn sppf_add(
         "
                 p.sppf.add(",
         parse_node_kind,
-        ", c.fn_input.subtract_suffix(_range), ",
+        ", c.frame.range.subtract_suffix(_range), ",
         child,
         ");"
     )
@@ -1285,9 +1285,9 @@ impl<Pat: Ord + Hash + MatchesEmpty + ToRustSrc> Rule<Pat> {
             )(cont),
             (Rule::Concat([left, right]), Some(parse_nodes)) => (
                 thunk!("
-                assert_eq!(_range.start(), c.fn_input.start());") +
+                assert_eq!(_range.start(), c.frame.range.start());") +
                 left.generate_parse(Some(parse_nodes)) +
-                push_state("c.fn_input.subtract_suffix(_range).len()") +
+                push_state("c.frame.range.subtract_suffix(_range).len()") +
                 right.generate_parse(Some(parse_nodes)) +
                 pop_state(|state| sppf_add(&self.parse_node_kind(parse_nodes), state))
             )(cont),
@@ -1298,7 +1298,7 @@ impl<Pat: Ord + Hash + MatchesEmpty + ToRustSrc> Rule<Pat> {
             }
             (Rule::Or(rules), Some(parse_nodes)) => (
                 thunk!("
-                assert_eq!(_range.start(), c.fn_input.start());") +
+                assert_eq!(_range.start(), c.frame.range.start());") +
                 parallel(ThunkIter(rules.iter().map(|rule| {
                     push_state(&format!("{}.to_usize()", rule.parse_node_kind(parse_nodes))) +
                     rule.generate_parse(Some(parse_nodes))
@@ -1313,9 +1313,9 @@ impl<Pat: Ord + Hash + MatchesEmpty + ToRustSrc> Rule<Pat> {
                 let more = Rc::new(Rule::RepeatMore(rule.clone(), None));
                 opt(
                     thunk!("
-                assert_eq!(_range.start(), c.fn_input.start());") +
+                assert_eq!(_range.start(), c.frame.range.start());") +
                     rule.generate_parse(Some(parse_nodes)) +
-                    push_state("c.fn_input.subtract_suffix(_range).len()") +
+                    push_state("c.frame.range.subtract_suffix(_range).len()") +
                     call(label) +
                     pop_state(move |state| sppf_add(&more.parse_node_kind(parse_nodes), state))
                 )
@@ -1331,22 +1331,22 @@ impl<Pat: Ord + Hash + MatchesEmpty + ToRustSrc> Rule<Pat> {
             })(cont),
             (Rule::RepeatMore(rule, None), Some(parse_nodes)) => fix(|label| {
                 thunk!("
-                assert_eq!(_range.start(), c.fn_input.start());") +
+                assert_eq!(_range.start(), c.frame.range.start());") +
                 rule.generate_parse(Some(parse_nodes)) +
-                push_state("c.fn_input.subtract_suffix(_range).len()") +
+                push_state("c.frame.range.subtract_suffix(_range).len()") +
                 opt(call(label)) +
                 pop_state(|state| sppf_add(&self.parse_node_kind(parse_nodes), state))
             })(cont),
             (Rule::RepeatMore(elem, Some(sep)), Some(parse_nodes)) => fix(|label| {
                 thunk!("
-                assert_eq!(_range.start(), c.fn_input.start());") +
+                assert_eq!(_range.start(), c.frame.range.start());") +
                 elem.generate_parse(Some(parse_nodes)) +
-                push_state("c.fn_input.subtract_suffix(_range).len()") +
+                push_state("c.frame.range.subtract_suffix(_range).len()") +
                 opt(
                     thunk!("
-                assert_eq!(_range.start(), c.fn_input.start());") +
+                assert_eq!(_range.start(), c.frame.range.start());") +
                     sep.generate_parse(None) +
-                    push_state("c.fn_input.subtract_suffix(_range).len()") +
+                    push_state("c.frame.range.subtract_suffix(_range).len()") +
                     call(label) +
                     pop_state(|state| {
                         sppf_add(&Rc::new(Rule::Concat([

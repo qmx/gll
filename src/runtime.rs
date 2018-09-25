@@ -2,12 +2,15 @@ extern crate indexing;
 
 use indexing::container_traits::{Contiguous, Trustworthy};
 use indexing::{scope, Container};
+use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::ops::{Deref, RangeInclusive};
+use std::rc::{Rc, Weak};
 use std::str;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -180,7 +183,7 @@ impl<'i, P: ParseNodeKind, C: CodeLabel, I: Trustworthy> Parser<'i, P, C, I> {
                         seen: BTreeSet::new(),
                     },
                     gss: GraphStack {
-                        returns: HashMap::new(),
+                        nodes: HashMap::new(),
                     },
                     memoizer: Memoizer {
                         lengths: HashMap::new(),
@@ -218,19 +221,29 @@ impl<'i, P: ParseNodeKind, C: CodeLabel, I: Trustworthy> Parser<'i, P, C, I> {
             .map(|n| Range(range.split_at(range.len() - n).0))
     }
     pub fn call(&mut self, call: Call<'i, C>, next: Continuation<'i, C>) {
-        let returns = self.gss.returns.entry(call).or_default();
-        if returns.insert(next) {
-            if returns.len() > 1 {
-                if let Some(lengths) = self.memoizer.lengths.get(&call) {
-                    for &len in lengths {
-                        self.threads.spawn(next, Range(call.range.split_at(len).1));
+        match self.gss.nodes.entry(call) {
+            Entry::Occupied(entry) => {
+                let duplicate = match entry.get().upgrade() {
+                    Some(node) => !node.returns.borrow_mut().insert(next.clone()),
+                    None => false,
+                };
+                if !duplicate {
+                    if let Some(lengths) = self.memoizer.lengths.get(&call) {
+                        for &len in lengths {
+                            self.threads
+                                .spawn(next.clone(), Range(call.range.split_at(len).1));
+                        }
                     }
                 }
-            } else {
+            }
+            Entry::Vacant(entry) => {
+                let node = Rc::new(StackNode::new(call.range));
+                node.returns.borrow_mut().insert(next);
+                entry.insert(Rc::downgrade(&node));
                 self.threads.spawn(
                     Continuation {
                         code: call.callee,
-                        fn_input: call.range,
+                        frame: node,
                         state: 0,
                     },
                     call.range,
@@ -241,7 +254,7 @@ impl<'i, P: ParseNodeKind, C: CodeLabel, I: Trustworthy> Parser<'i, P, C, I> {
     pub fn ret(&mut self, from: Continuation<'i, C>, remaining: Range<'i>) {
         let call = Call {
             callee: from.code.enclosing_fn(),
-            range: from.fn_input,
+            range: from.frame.range,
         };
         if self
             .memoizer
@@ -250,10 +263,8 @@ impl<'i, P: ParseNodeKind, C: CodeLabel, I: Trustworthy> Parser<'i, P, C, I> {
             .or_default()
             .insert(call.range.subtract_suffix(remaining).len())
         {
-            if let Some(returns) = self.gss.returns.get(&call) {
-                for &next in returns {
-                    self.threads.spawn(next, remaining);
-                }
+            for next in &*from.frame.returns.borrow() {
+                self.threads.spawn(next.clone(), remaining);
             }
         }
     }
@@ -280,7 +291,7 @@ impl<'i, C: CodeLabel> Threads<'i, C> {
             callee: next,
             range,
         };
-        if self.seen.insert(t) {
+        if self.seen.insert(t.clone()) {
             self.queue.push(t);
         }
     }
@@ -305,11 +316,37 @@ impl<'i, C: CodeLabel> Threads<'i, C> {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone)]
 pub struct Continuation<'i, C: CodeLabel> {
     pub code: C,
-    pub fn_input: Range<'i>,
+    pub frame: Rc<StackNode<'i, C>>,
     pub state: usize,
+}
+
+impl<'i, C: CodeLabel> Continuation<'i, C> {
+    fn cmp_key(&self) -> impl Ord + 'i {
+        (self.code, self.frame.range, self.state)
+    }
+}
+
+impl<'i, C: CodeLabel> PartialEq for Continuation<'i, C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp_key() == other.cmp_key()
+    }
+}
+
+impl<'i, C: CodeLabel> Eq for Continuation<'i, C> {}
+
+impl<'i, C: CodeLabel> PartialOrd for Continuation<'i, C> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.cmp_key().partial_cmp(&other.cmp_key())
+    }
+}
+
+impl<'i, C: CodeLabel> Ord for Continuation<'i, C> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cmp_key().cmp(&other.cmp_key())
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -342,26 +379,42 @@ impl<'i, C: Ord> Ord for Call<'i, C> {
     }
 }
 
+pub struct StackNode<'i, C: CodeLabel> {
+    pub range: Range<'i>,
+    returns: RefCell<BTreeSet<Continuation<'i, C>>>,
+}
+
+impl<'i, C: CodeLabel> StackNode<'i, C> {
+    pub fn new(range: Range<'i>) -> Self {
+        StackNode {
+            range,
+            returns: RefCell::new(BTreeSet::new()),
+        }
+    }
+}
+
 pub struct GraphStack<'i, C: CodeLabel> {
-    returns: HashMap<Call<'i, C>, BTreeSet<Continuation<'i, C>>>,
+    nodes: HashMap<Call<'i, C>, Weak<StackNode<'i, C>>>,
 }
 
 impl<'i, C: CodeLabel> GraphStack<'i, C> {
     pub fn print(&self, out: &mut Write) -> io::Result<()> {
         writeln!(out, "digraph gss {{")?;
         writeln!(out, "    graph [rankdir=RL]")?;
-        for (call, returns) in &self.returns {
-            for next in returns {
-                writeln!(
-                    out,
-                    r#"    "{:?}" -> "{:?}" [label="{:?}"]"#,
-                    call,
-                    Call {
-                        callee: next.code.enclosing_fn(),
-                        range: next.fn_input
-                    },
-                    next.code
-                )?;
+        for (call, node) in &self.nodes {
+            if let Some(node) = node.upgrade() {
+                for next in &*node.returns.borrow() {
+                    writeln!(
+                        out,
+                        r#"    "{:?}" -> "{:?}" [label="{:?}"]"#,
+                        call,
+                        Call {
+                            callee: next.code.enclosing_fn(),
+                            range: next.frame.range
+                        },
+                        next.code
+                    )?;
+                }
             }
         }
         writeln!(out, "}}")

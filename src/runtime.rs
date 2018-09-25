@@ -189,7 +189,7 @@ impl<'i, P: ParseNodeKind, C: CodeLabel, I: Trustworthy> Parser<'i, P, C, I> {
                         lengths: HashMap::new(),
                     },
                     sppf: ParseForest {
-                        children: HashMap::new(),
+                        nodes: HashMap::new(),
                     },
                 },
                 Range(range),
@@ -444,15 +444,31 @@ impl<'i, C: CodeLabel> Memoizer<'i, C> {
     }
 }
 
+pub struct ParseNodeData<'i> {
+    pub range: Range<'i>,
+    pub children: RefCell<BTreeSet<usize>>,
+}
+
+impl<'i> ParseNodeData<'i> {
+    pub fn new(range: Range<'i>) -> Self {
+        ParseNodeData {
+            range,
+            children: RefCell::new(BTreeSet::new()),
+        }
+    }
+}
+
 pub struct ParseForest<'i, P: ParseNodeKind> {
-    pub children: HashMap<ParseNode<'i, P>, BTreeSet<usize>>,
+    pub nodes: HashMap<ParseNode<'i, P>, Rc<ParseNodeData<'i>>>,
 }
 
 impl<'i, P: ParseNodeKind> ParseForest<'i, P> {
     pub fn add(&mut self, kind: P, range: Range<'i>, child: usize) {
-        self.children
+        self.nodes
             .entry(ParseNode { kind, range })
-            .or_default()
+            .or_insert_with(|| Rc::new(ParseNodeData::new(range)))
+            .children
+            .borrow_mut()
             .insert(child);
     }
 
@@ -464,9 +480,11 @@ impl<'i, P: ParseNodeKind> ParseForest<'i, P> {
             ParseNodeShape::Alias(kind) => (Some(kind), None),
             ParseNodeShape::Choice => (
                 None,
-                self.children
-                    .get(&node)
-                    .map(|children| children.iter().cloned().map(|i| P::from_usize(i))),
+                //self.nodes.get(&node).cloned().map(|node| {
+                    Some({//unreachable!();
+                    //node.children.borrow().iter()
+                    vec![!0].into_iter().map(|i| P::from_usize(i))})
+                //}),
             ),
             shape => unreachable!("unary_children({}): non-unary shape {}", node, shape),
         };
@@ -499,12 +517,20 @@ impl<'i, P: ParseNodeKind> ParseForest<'i, P> {
         node: ParseNode<'i, P>,
     ) -> impl Iterator<Item = (ParseNode<'i, P>, ParseNode<'i, P>)> + 'a {
         match node.kind.shape() {
-            ParseNodeShape::Binary(left_kind, right_kind) => self
-                .children
+            ParseNodeShape::Binary(left_kind, right_kind) =>
+            /*self
+                .nodes
                 .get(&node)
+                .cloned()
                 .into_iter()
-                .flatten()
-                .map(move |&i| {
+                .flat_map(|node| {
+                    unreachable!();
+                    //node.children.borrow().iter()
+                    */
+            {
+                vec![!0].into_iter()
+                //})
+                .map(move |i| {
                     let (left, right, _) = node.range.split_at(i);
                     (
                         ParseNode {
@@ -516,14 +542,15 @@ impl<'i, P: ParseNodeKind> ParseForest<'i, P> {
                             range: Range(right),
                         },
                     )
-                }),
+                })
+            }
             shape => unreachable!("binary_children({}): non-binary shape {}", node, shape),
         }
     }
 
     pub fn print(&self, out: &mut Write) -> io::Result<()> {
         writeln!(out, "digraph sppf {{")?;
-        let mut queue: VecDeque<_> = self.children.keys().cloned().collect();
+        let mut queue: VecDeque<_> = self.nodes.keys().cloned().collect();
         let mut seen: BTreeSet<_> = queue.iter().cloned().collect();
         let mut p = 0;
         while let Some(source) = queue.pop_front() {
